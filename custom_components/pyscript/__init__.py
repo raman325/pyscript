@@ -807,7 +807,7 @@ class PyscriptFileEntity(ToggleEntity, RestoreEntity):
         await self.async_reload_file()
         self._state = STATE_ON
         self.async_write_ha_state()
-        async_dispatcher_send(self.hass, f"{self.unique_id}.{STATE_ON}")
+        async_dispatcher_send(self.hass, f"{DOMAIN}.{self.unique_id}", self.state)
 
     async def async_turn_off(self, **kwargs: Any) -> None:
         """Turn the entity off."""
@@ -815,7 +815,7 @@ class PyscriptFileEntity(ToggleEntity, RestoreEntity):
         GlobalContextMgr.delete(self._ctx)
         self._state = STATE_OFF
         self.async_write_ha_state()
-        async_dispatcher_send(self.hass, f"{self.unique_id}.{STATE_OFF}")
+        async_dispatcher_send(self.hass, f"{DOMAIN}.{self.unique_id}", self.state)
 
     async def async_trigger(self, run_variables, context=None, skip_condition=False):
         """Trigger automation.
@@ -902,18 +902,15 @@ class PyscriptChildEntity(ToggleEntity, RestoreEntity):
         if not enable_automation:
             await self.async_turn_off()
 
-        async def handle_off_state():
-            if self._state == STATE_OFF:
+        async def handle_parent_state_change(state: str) -> None:
+            if state == STATE_ON and self._state == STATE_OFF:
                 await self.async_turn_off()
+            elif state == STATE_OFF:
+                self.async_write_ha_state()
 
         self.async_on_remove(
             async_dispatcher_connect(
-                self.hass, f"{self._parent_entity.unique_id}.{STATE_ON}", handle_off_state
-            )
-        )
-        self.async_on_remove(
-            async_dispatcher_connect(
-                self.hass, f"{self._parent_entity.unique_id}.{STATE_OFF}", self.async_write_ha_state
+                self.hass, f"{DOMAIN}.{self._parent_entity.unique_id}", handle_parent_state_change
             )
         )
 
