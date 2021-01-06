@@ -652,23 +652,27 @@ async def load_scripts(hass: HomeAssistant, config_data: Dict[str, Any], global_
     for global_ctx_name in ctx_delete:
         if global_ctx_name in ctx_all:
             global_ctx = ctx_all[global_ctx_name]
-            if len(global_ctx.triggers) > 1:
-                entity_id = entity_registry.async_get_entity_id(
-                    AUTO_DOMAIN, DOMAIN, f"{DOMAIN}.{global_ctx.get_name()}"
-                )
-                if entity_id is not None:
-                    await auto_platform.async_remove_entity(entity_id)
+
+            entity_id = entity_registry.async_get_entity_id(
+                AUTO_DOMAIN, DOMAIN, f"{DOMAIN}.{global_ctx.get_name()}"
+            )
+            if entity_id is not None:
+                await auto_platform.async_remove_entity(entity_id)
+                entity_registry.async_remove(entity_id)
+
             for trigger in global_ctx.triggers:
                 entity_id = entity_registry.async_get_entity_id(
                     AUTO_DOMAIN,
                     DOMAIN,
                     (
-                        f"{DOMAIN}.{global_ctx.get_name()}.{trigger.get_name()}.",
-                        f"{json.dumps(trigger.trigger_decorators())}",
+                        f"{DOMAIN}.{global_ctx.get_name()}.{trigger.get_name()}."
+                        f"{json.dumps(trigger.trigger_decorators())}"
                     ),
                 )
                 if entity_id is not None:
                     await auto_platform.async_remove_entity(entity_id)
+                    entity_registry.async_remove(entity_id)
+
             global_ctx.stop()
             if global_ctx_name not in ctx2files or not ctx2files[global_ctx_name].autoload:
                 _LOGGER.info("Unloaded %s", global_ctx.get_file_path())
@@ -709,19 +713,25 @@ async def load_scripts(hass: HomeAssistant, config_data: Dict[str, Any], global_
         auto_entities_to_add = []
         for load_file_args in ctx_to_add:
             file_entity = None
-            if len(load_file_args["global_ctx"].triggers) > 1:
+
+            # Filter EvalFunc down to non service based triggers
+            automation_triggers = [
+                trigger for trigger in load_file_args["global_ctx"].triggers if not trigger.trigger_service
+            ]
+
+            # We only need a file/module/app entity if we are registering more than one automation for it
+            if len(automation_triggers) > 1:
                 file_entity = PyscriptFileEntity(load_file_args)
                 auto_entities_to_add.append(file_entity)
 
-            child_entities = []
-            for trigger in load_file_args["global_ctx"].triggers:
-                if not trigger.trigger_service:
-                    child_entities.append(PyscriptChildEntity(load_file_args, trigger, file_entity))
+            child_entities = [
+                PyscriptChildEntity(load_file_args, trigger, file_entity) for trigger in automation_triggers
+            ]
             if file_entity:
                 file_entity.link_to_child_entities(child_entities)
             auto_entities_to_add.extend(child_entities)
 
-    await auto_platform.async_add_entities(auto_entities_to_add)
+        await auto_platform.async_add_entities(auto_entities_to_add)
 
 
 class PyscriptFileEntity(ToggleEntity, RestoreEntity):
@@ -847,8 +857,7 @@ class PyscriptChildEntity(ToggleEntity, RestoreEntity):
         self._state: str = STATE_ON
         self._decorators = self._trigger.trigger_decorators()
         self._id: str = (
-            f"{DOMAIN}.{self._ctx.get_name()}.{self._trigger.get_name()}.",
-            f"{json.dumps(self._decorators)}",
+            f"{DOMAIN}.{self._ctx.get_name()}.{self._trigger.get_name()}.{json.dumps(self._decorators)}"
         )
         self._logger = None
 
