@@ -278,11 +278,10 @@ class EvalFunc:
 
     def trigger_decorators(self):
         """Return a dictionary of trigger decorators and args/kwargs."""
-        return (
-            {k: v for k, v in self.trigger.trig_cfg.items() if k in TRIG_DECORATORS}
-            if self.trigger is not None
-            else {}
-        )
+        if self.trigger is None:
+            return {}
+
+        return {k: v for k, v in self.trigger.trig_cfg.items() if k in TRIG_DECORATORS}
 
     async def eval_defaults(self, ast_ctx) -> None:
         """Evaluate the default function arguments."""

@@ -646,7 +646,8 @@ async def load_scripts(hass: HomeAssistant, config_data: Dict[str, Any], global_
     entity_registry = await hass.helpers.entity_registry.async_get_registry()
 
     #
-    # delete contexts that are no longer needed or will be reloaded
+    # delete contexts that are no longer needed or will be reloaded, and delete corresponding
+    # entities
     #
     for global_ctx_name in ctx_delete:
         if global_ctx_name in ctx_all:
@@ -700,6 +701,10 @@ async def load_scripts(hass: HomeAssistant, config_data: Dict[str, Any], global_
         await GlobalContextMgr.load_file(**load_file_args)
         ctx_to_add.append(load_file_args)
 
+    #
+    # now create entities for every automation, and every file/app/module
+    # that has more than one automation
+    #
     if ctx_to_add:
         auto_entities_to_add = []
         for load_file_args in ctx_to_add:
@@ -783,9 +788,13 @@ class PyscriptFileEntity(ToggleEntity, RestoreEntity):
         if not enable_automation:
             await self.async_turn_off()
 
+    async def async_reload_file(self) -> None:
+        """Reload file into GlobalContextMgr."""
+        await GlobalContextMgr.load_file(self._ctx, self._file_path, self._source, True)
+
     async def async_turn_on(self, **kwargs: Any) -> None:
         """Turn the entity on and update the state."""
-        await GlobalContextMgr.load_file(self._ctx, self._file_path, self._source, True)
+        await self.async_reload_file()
         self._state = STATE_ON
         self.async_write_ha_state()
         async_dispatcher_send(self.hass, f"{self.unique_id}.{STATE_ON}")
@@ -820,7 +829,7 @@ class PyscriptFileEntity(ToggleEntity, RestoreEntity):
 
 
 class PyscriptChildEntity(ToggleEntity, RestoreEntity):
-    """Entity to show state of and control a pyscript file."""
+    """Entity to show state of and control a pyscript automation."""
 
     def __init__(
         self,
@@ -862,7 +871,7 @@ class PyscriptChildEntity(ToggleEntity, RestoreEntity):
     def is_on(self) -> bool:
         """Return True if entity is on."""
         return self._state == STATE_ON and (
-            self._parent_entity.state == STATE_ON or self._parent_entity is None
+            self._parent_entity is None or self._parent_entity.state == STATE_ON
         )
 
     async def async_added_to_hass(self) -> None:
