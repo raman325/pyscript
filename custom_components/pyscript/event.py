@@ -1,6 +1,10 @@
 """Handles event firing and notification."""
-
+import asyncio
 import logging
+from typing import Any, Dict
+
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.event import Event as HAEvent
 
 from .const import LOGGER_PATH
 
@@ -26,13 +30,13 @@ class Event:
         _LOGGER.error("Event class is not meant to be instantiated")
 
     @classmethod
-    def init(cls, hass):
+    def init(cls, hass: HomeAssistant) -> None:
         """Initialize Event."""
 
         cls.hass = hass
 
     @classmethod
-    async def event_listener(cls, event):
+    async def event_listener(cls, event: HAEvent) -> None:
         """Listen callback for given event which updates any notifications."""
 
         func_args = {
@@ -44,7 +48,7 @@ class Event:
         await cls.update(event.event_type, func_args)
 
     @classmethod
-    def notify_add(cls, event_type, queue):
+    def notify_add(cls, event_type: str, queue: asyncio.Queue) -> None:
         """Register to notify for events of given type to be sent to queue."""
 
         if event_type not in cls.notify:
@@ -54,7 +58,7 @@ class Event:
         cls.notify[event_type].add(queue)
 
     @classmethod
-    def notify_del(cls, event_type, queue):
+    def notify_del(cls, event_type: str, queue: asyncio.Queue) -> None:
         """Unregister to notify for events of given type for given queue."""
 
         if event_type not in cls.notify or queue not in cls.notify[event_type]:
@@ -67,7 +71,7 @@ class Event:
             del cls.notify_remove[event_type]
 
     @classmethod
-    async def update(cls, event_type, func_args):
+    async def update(cls, event_type: str, func_args: Dict[str, Any]):
         """Deliver all notifications for an event of the given type."""
 
         _LOGGER.debug("event.update(%s, %s, %s)", event_type, vars, func_args)

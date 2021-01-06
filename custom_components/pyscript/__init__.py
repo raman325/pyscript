@@ -1,18 +1,20 @@
 """Component to allow running Python scripts."""
 
 import asyncio
+from datetime import timedelta
 import glob
 import json
 import logging
 import os
 import time
 import traceback
-from typing import Any, Callable, Dict, List, Set, Union
+from typing import Any, Callable, Dict, List, Optional, Set, Union
 
 import voluptuous as vol
 from watchdog.events import DirModifiedEvent, FileSystemEvent, FileSystemEventHandler
 import watchdog.observers
 
+from homeassistant.components.automation import DOMAIN as AUTO_DOMAIN
 from homeassistant.config import async_hass_config_yaml
 from homeassistant.config_entries import SOURCE_IMPORT, ConfigEntry
 from homeassistant.const import (
@@ -20,12 +22,17 @@ from homeassistant.const import (
     EVENT_HOMEASSISTANT_STOP,
     EVENT_STATE_CHANGED,
     SERVICE_RELOAD,
+    STATE_OFF,
+    STATE_ON,
 )
-from homeassistant.core import Config, HomeAssistant, ServiceCall
+from homeassistant.core import Config, HomeAssistant, ServiceCall, split_entity_id
 from homeassistant.exceptions import HomeAssistantError
 import homeassistant.helpers.config_validation as cv
+from homeassistant.helpers.dispatcher import async_dispatcher_connect, async_dispatcher_send
+from homeassistant.helpers.entity import ToggleEntity
+from homeassistant.helpers.entity_platform import EntityPlatform
 from homeassistant.helpers.event import Event as HAEvent
-from homeassistant.helpers.restore_state import RestoreStateData
+from homeassistant.helpers.restore_state import RestoreEntity, RestoreStateData
 from homeassistant.loader import bind_hass
 
 from .const import (
@@ -42,7 +49,7 @@ from .const import (
     WATCHDOG_OBSERVER,
     WATCHDOG_TASK,
 )
-from .eval import AstEval
+from .eval import AstEval, EvalFunc
 from .event import Event
 from .function import Function
 from .global_ctx import GlobalContext, GlobalContextMgr
@@ -249,6 +256,17 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> b
     hass.data.setdefault(DOMAIN, {})
     hass.data[DOMAIN][CONFIG_ENTRY] = config_entry
     hass.data[DOMAIN][UNSUB_LISTENERS] = []
+    auto_entity_platform = EntityPlatform(
+        hass=hass,
+        logger=_LOGGER,
+        domain=AUTO_DOMAIN,
+        platform_name=DOMAIN,
+        platform=None,
+        scan_interval=timedelta(seconds=0),
+        entity_namespace=DOMAIN,
+    )
+    auto_entity_platform.config_entry = config_entry
+    hass.data[DOMAIN][AUTO_DOMAIN] = auto_entity_platform
 
     State.set_pyscript_config(config_entry.data)
 
@@ -623,12 +641,33 @@ async def load_scripts(hass: HomeAssistant, config_data: Dict[str, Any], global_
                 ctx_delete.add(ctx_name)
         done.add(root)
 
+    # Get automation entity_platform and entity_registry so we can add and remove entities
+    auto_platform: EntityPlatform = hass.data[DOMAIN][AUTO_DOMAIN]
+    entity_registry = await hass.helpers.entity_registry.async_get_registry()
+
     #
     # delete contexts that are no longer needed or will be reloaded
     #
     for global_ctx_name in ctx_delete:
         if global_ctx_name in ctx_all:
             global_ctx = ctx_all[global_ctx_name]
+            if len(global_ctx.triggers) > 1:
+                entity_id = entity_registry.async_get_entity_id(
+                    AUTO_DOMAIN, DOMAIN, f"{DOMAIN}.{global_ctx.get_name()}"
+                )
+                if entity_id is not None:
+                    await auto_platform.async_remove_entity(entity_id)
+            for trigger in global_ctx.triggers:
+                entity_id = entity_registry.async_get_entity_id(
+                    AUTO_DOMAIN,
+                    DOMAIN,
+                    (
+                        f"{DOMAIN}.{global_ctx.get_name()}.{trigger.get_name()}.",
+                        f"{json.dumps(trigger.trigger_decorators())}",
+                    ),
+                )
+                if entity_id is not None:
+                    await auto_platform.async_remove_entity(entity_id)
             global_ctx.stop()
             if global_ctx_name not in ctx2files or not ctx2files[global_ctx_name].autoload:
                 _LOGGER.info("Unloaded %s", global_ctx.get_file_path())
@@ -638,6 +677,7 @@ async def load_scripts(hass: HomeAssistant, config_data: Dict[str, Any], global_
     #
     # now load the requested files, and files that depend on loaded files
     #
+    ctx_to_add = []
     for global_ctx_name, src_info in sorted(ctx2files.items()):
         if not src_info.autoload or not src_info.force:
             continue
@@ -651,6 +691,255 @@ async def load_scripts(hass: HomeAssistant, config_data: Dict[str, Any], global_
             mtime=src_info.mtime,
         )
         reload = src_info.global_ctx_name in ctx_delete
-        await GlobalContextMgr.load_file(
-            global_ctx, src_info.file_path, source=src_info.source, reload=reload
+        load_file_args = {
+            "global_ctx": global_ctx,
+            "file_path": src_info.file_path,
+            "source": src_info.source,
+            "reload": reload,
+        }
+        await GlobalContextMgr.load_file(**load_file_args)
+        ctx_to_add.append(load_file_args)
+
+    if ctx_to_add:
+        auto_entities_to_add = []
+        for load_file_args in ctx_to_add:
+            file_entity = None
+            if len(load_file_args["global_ctx"].triggers) > 1:
+                file_entity = PyscriptFileEntity(load_file_args)
+                auto_entities_to_add.append(file_entity)
+
+            child_entities = []
+            for trigger in load_file_args["global_ctx"].triggers:
+                if not trigger.trigger_service:
+                    child_entities.append(PyscriptChildEntity(load_file_args, trigger, file_entity))
+            if file_entity:
+                file_entity.link_to_child_entities(child_entities)
+            auto_entities_to_add.extend(child_entities)
+
+    await auto_platform.async_add_entities(auto_entities_to_add)
+
+
+class PyscriptFileEntity(ToggleEntity, RestoreEntity):
+    """Entity to show state of and control a pyscript file."""
+
+    def __init__(self, load_file_args: Dict[str, Union[str, bool, GlobalContext]]) -> None:
+        """Initialize a pyscript file entity."""
+        self._ctx: GlobalContext = load_file_args["global_ctx"]
+        self._name: str = self._ctx.get_name()
+        self._file_path: str = load_file_args["file_path"]
+        self._source: str = load_file_args["source"]
+        self._state: str = STATE_ON
+        self._id: str = f"{DOMAIN}.{self._name}"
+        self._logger = None
+        self._child_entities = []
+
+    @property
+    def name(self):
+        """Name of the automation."""
+        return self._name
+
+    @property
+    def unique_id(self):
+        """Return unique ID."""
+        return self._id
+
+    @property
+    def should_poll(self):
+        """No polling needed for automation entities."""
+        return False
+
+    async def link_to_child_entities(self, child_entities) -> None:
+        """Link entity to child entities."""
+        if self._child_entities:
+            pass
+        self._child_entities = child_entities
+
+    @property
+    def is_on(self) -> bool:
+        """Return True if entity is on."""
+        return self._state == STATE_ON
+
+    async def async_added_to_hass(self) -> None:
+        """Startup with initial state or previous state."""
+        self._logger = logging.getLogger(f"{__name__}.{split_entity_id(self.entity_id)[1]}")
+
+        state = await self.async_get_last_state()
+        if state:
+            enable_automation = state.state == STATE_ON
+            self._logger.debug(
+                "Loaded automation %s with state %s from state " " storage last state %s",
+                self.entity_id,
+                enable_automation,
+                state,
+            )
+        else:
+            enable_automation = STATE_ON
+            self._logger.debug(
+                "Automation %s not in state storage, state %s from default is used",
+                self.entity_id,
+                enable_automation,
+            )
+
+        if not enable_automation:
+            await self.async_turn_off()
+
+    async def async_turn_on(self, **kwargs: Any) -> None:
+        """Turn the entity on and update the state."""
+        await GlobalContextMgr.load_file(self._ctx, self._file_path, self._source, True)
+        self._state = STATE_ON
+        self.async_write_ha_state()
+        async_dispatcher_send(self.hass, f"{self.unique_id}.{STATE_ON}")
+
+    async def async_turn_off(self, **kwargs: Any) -> None:
+        """Turn the entity off."""
+        self._ctx.stop()
+        GlobalContextMgr.delete(self._ctx)
+        self._state = STATE_OFF
+        self.async_write_ha_state()
+        async_dispatcher_send(self.hass, f"{self.unique_id}.{STATE_OFF}")
+
+    async def async_trigger(self, run_variables, context=None, skip_condition=False):
+        """Trigger automation.
+
+        This method is a coroutine.
+        """
+        raise NotImplementedError
+
+    @property
+    def state_attributes(self):
+        """Return the entity state attributes."""
+        return None
+
+    @property
+    def device_state_attributes(self):
+        """Return automation attributes."""
+        if self._id is None:
+            return None
+
+        return {"id": self._id}
+
+
+class PyscriptChildEntity(ToggleEntity, RestoreEntity):
+    """Entity to show state of and control a pyscript file."""
+
+    def __init__(
+        self,
+        load_file_args: Dict[str, Union[str, bool, GlobalContext]],
+        trigger: EvalFunc,
+        parent_entity: Optional[PyscriptFileEntity],
+    ) -> None:
+        """Initialize pyscript automation entity."""
+        self._ctx: GlobalContext = load_file_args["global_ctx"]
+        self._trigger: EvalFunc = trigger
+        self._parent_entity = parent_entity
+        self._name: str = f"{self._ctx.get_name()} - {AUTO_DOMAIN}.{self._trigger.get_name()}"
+        self._file_path: str = load_file_args["file_path"]
+        self._source: str = load_file_args["source"]
+        self._state: str = STATE_ON
+        self._decorators = self._trigger.trigger_decorators()
+        self._id: str = (
+            f"{DOMAIN}.{self._ctx.get_name()}.{self._trigger.get_name()}.",
+            f"{json.dumps(self._decorators)}",
         )
+        self._logger = None
+
+    @property
+    def name(self):
+        """Name of the automation."""
+        return self._name
+
+    @property
+    def unique_id(self):
+        """Return unique ID."""
+        return self._id
+
+    @property
+    def should_poll(self):
+        """No polling needed for automation entities."""
+        return False
+
+    @property
+    def is_on(self) -> bool:
+        """Return True if entity is on."""
+        return self._state == STATE_ON and (
+            self._parent_entity.state == STATE_ON or self._parent_entity is None
+        )
+
+    async def async_added_to_hass(self) -> None:
+        """Startup with initial state or previous state."""
+        self._logger = logging.getLogger(f"{__name__}.{split_entity_id(self.entity_id)[1]}")
+
+        state = await self.async_get_last_state()
+        if state:
+            enable_automation = state.state == STATE_ON
+            self._logger.debug(
+                "Loaded automation %s with state %s from state " " storage last state %s",
+                self.entity_id,
+                enable_automation,
+                state,
+            )
+        else:
+            enable_automation = STATE_ON
+            self._logger.debug(
+                "Automation %s not in state storage, state %s from default is used",
+                self.entity_id,
+                enable_automation,
+            )
+
+        if not enable_automation:
+            await self.async_turn_off()
+
+        async def handle_off_state():
+            if self._state == STATE_OFF:
+                await self.async_turn_off()
+
+        self.async_on_remove(
+            async_dispatcher_connect(
+                self.hass, f"{self._parent_entity.unique_id}.{STATE_ON}", handle_off_state
+            )
+        )
+        self.async_on_remove(
+            async_dispatcher_connect(
+                self.hass, f"{self._parent_entity.unique_id}.{STATE_OFF}", self.async_write_ha_state
+            )
+        )
+
+    async def async_turn_on(self, **kwargs: Any) -> None:
+        """Turn the entity on and update the state."""
+        self._state = STATE_ON
+        await self._parent_entity.async_turn_on(**kwargs)
+        self.async_write_ha_state()
+
+    async def async_turn_off(self, **kwargs: Any) -> None:
+        """Turn the entity off."""
+        self._trigger.trigger_stop()
+        self._state = STATE_OFF
+        self.async_write_ha_state()
+
+    async def async_trigger(self, run_variables, context=None, skip_condition=False):
+        """Trigger automation.
+
+        This method is a coroutine.
+        """
+        raise NotImplementedError
+
+    @property
+    def state_attributes(self):
+        """Return the entity state attributes."""
+        return None
+
+    @property
+    def device_state_attributes(self):
+        """Return automation attributes."""
+        data = {}
+        if self._id is not None:
+            data["id"] = self._id
+        if self._decorators is not None:
+            data["decorators"] = self._decorators
+        if self.state == STATE_OFF:
+            if self._parent_entity and self._parent_entity.state == STATE_OFF:
+                data["disabled_by"] = "parent"
+            else:
+                data["disabled_by"] = "self"
+
+        return {"id": self._id, "decorators": self._decorators}

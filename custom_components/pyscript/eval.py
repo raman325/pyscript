@@ -268,11 +268,23 @@ class EvalFunc:
         self.trigger_service = False
         self.has_closure = False
 
-    def get_name(self):
+    def get_name(self) -> str:
         """Return the function name."""
         return self.name
 
-    async def eval_defaults(self, ast_ctx):
+    def is_on(self) -> bool:
+        """Return whether or not the function has been started."""
+        return self.trigger.task is not None if self.trigger is not None else self.trigger_service
+
+    def trigger_decorators(self):
+        """Return a dictionary of trigger decorators and args/kwargs."""
+        return (
+            {k: v for k, v in self.trigger.trig_cfg.items() if k in TRIG_DECORATORS}
+            if self.trigger is not None
+            else {}
+        )
+
+    async def eval_defaults(self, ast_ctx) -> None:
         """Evaluate the default function arguments."""
         self.defaults = []
         for val in self.func_def.args.defaults:
@@ -282,7 +294,7 @@ class EvalFunc:
         for val in self.func_def.args.kw_defaults:
             self.kw_defaults.append({"ok": bool(val), "val": None if not val else await ast_ctx.aeval(val)})
 
-    async def trigger_init(self):
+    async def trigger_init(self) -> None:
         """Initialize decorator triggers for this function."""
         trig_args = {}
         got_reqd_dec = False
