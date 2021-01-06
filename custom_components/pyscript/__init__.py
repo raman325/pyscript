@@ -825,11 +825,6 @@ class PyscriptFileEntity(ToggleEntity, RestoreEntity):
         raise NotImplementedError
 
     @property
-    def state_attributes(self):
-        """Return the entity state attributes."""
-        return None
-
-    @property
     def device_state_attributes(self):
         """Return automation attributes."""
         if self._id is None:
@@ -942,22 +937,17 @@ class PyscriptChildEntity(ToggleEntity, RestoreEntity):
         raise NotImplementedError
 
     @property
-    def state_attributes(self):
-        """Return the entity state attributes."""
-        return None
-
-    @property
     def device_state_attributes(self):
         """Return automation attributes."""
         data = {}
         if self._id is not None:
             data["id"] = self._id
+
         if self._decorators is not None:
             data["decorators"] = self._decorators
-        if self.state == STATE_OFF:
-            if self._parent_entity and self._parent_entity.state == STATE_OFF:
-                data["disabled_by"] = "parent"
-            else:
-                data["disabled_by"] = "self"
 
-        return {"id": self._id, "decorators": self._decorators}
+        if self.state == STATE_OFF:
+            data["disabled_by_parent"] = self._parent_entity and self._parent_entity.state == STATE_OFF
+            data["disabled_by_self"] = self._state == STATE_OFF
+
+        return data
