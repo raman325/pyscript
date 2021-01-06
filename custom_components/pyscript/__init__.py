@@ -657,7 +657,8 @@ async def load_scripts(hass: HomeAssistant, config_data: Dict[str, Any], global_
                 AUTO_DOMAIN, DOMAIN, f"{DOMAIN}.{global_ctx.get_name()}"
             )
             if entity_id is not None:
-                await auto_platform.async_remove_entity(entity_id)
+                if entity_id in auto_platform.entities:
+                    await auto_platform.async_remove_entity(entity_id)
                 entity_registry.async_remove(entity_id)
 
             for trigger in global_ctx.triggers:
@@ -670,7 +671,8 @@ async def load_scripts(hass: HomeAssistant, config_data: Dict[str, Any], global_
                     ),
                 )
                 if entity_id is not None:
-                    await auto_platform.async_remove_entity(entity_id)
+                    if entity_id in auto_platform.entities:
+                        await auto_platform.async_remove_entity(entity_id)
                     entity_registry.async_remove(entity_id)
 
             global_ctx.stop()
